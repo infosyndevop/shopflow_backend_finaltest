@@ -68,12 +68,12 @@ class ProductVariantCreate(BaseModel):
     )
 
     stock_quantity: Decimal = Field(
-        ...,
+        default=Decimal("0"),
         ge=0,
     )
 
     low_stock_threshold: Decimal = Field(
-        ...,
+        default=Decimal("0"),
         ge=0,
     )
 

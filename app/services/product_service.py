@@ -1,8 +1,12 @@
+import logging
 from uuid import UUID
 
 from fastapi import HTTPException, status
 
+logger = logging.getLogger(__name__)
+
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -13,6 +17,7 @@ from app.models.product_variant import ProductVariant
 from app.repositories.product_repository import ProductRepository
 
 from app.schemas.product import (
+    ProductVariantCreate,
     ProductVariantUpdate,
     ProductWithVariantsCreate,
     ProductVariantInventoryUpdate,
@@ -274,6 +279,214 @@ class ProductService:
             await db.rollback()
 
             raise
+
+    # =====================================================
+    # ADD PRODUCT VARIANT
+    # =====================================================
+
+    async def add_variant(
+        self,
+        db: AsyncSession,
+        tenant_id: UUID,
+        user_id: UUID,
+        product_id: UUID,
+        data: ProductVariantCreate,
+    ) -> ProductVariant:
+
+        try:
+            # -------------------------------------------------
+            # 1. Verify parent product exists and belongs to tenant
+            # -------------------------------------------------
+            product = await self.repository.get_product_by_id(
+                db=db,
+                tenant_id=tenant_id,
+                product_id=product_id,
+            )
+
+            if product is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Product not found",
+                )
+
+            # -------------------------------------------------
+            # 2. Sanitize and validate barcode
+            # -------------------------------------------------
+            barcode = (
+                data.barcode.strip()
+                if data.barcode
+                else None
+            )
+            if barcode == "":
+                barcode = None
+
+            if barcode is not None:
+                existing_variant = (
+                    await self.repository.get_variant_by_barcode(
+                        db=db,
+                        tenant_id=tenant_id,
+                        barcode=barcode,
+                    )
+                )
+
+                if existing_variant:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Barcode already exists: {barcode}",
+                    )
+
+            # -------------------------------------------------
+            # 3. Sanitize and validate SKU and unit
+            # -------------------------------------------------
+            sku = (
+                data.sku.strip()
+                if data.sku
+                else None
+            )
+            if sku == "":
+                sku = None
+
+            unit = data.unit.strip()
+            if not unit:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Unit cannot be empty",
+                )
+
+            # -------------------------------------------------
+            # 4. Validate prices, quantities, and stock
+            # -------------------------------------------------
+            if data.selling_price < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Selling price cannot be negative",
+                )
+
+            if data.offer_price is not None and data.offer_price < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Offer price cannot be negative",
+                )
+
+            if (
+                data.offer_price is not None
+                and data.offer_price > data.selling_price
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Offer price cannot be greater than selling price",
+                )
+
+            if data.package_quantity <= 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Package quantity must be greater than zero",
+                )
+
+            if data.stock_quantity < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Stock quantity cannot be negative",
+                )
+
+            if data.low_stock_threshold < 0:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Low stock threshold cannot be negative",
+                )
+
+            if data.tax_rate < 0 or data.tax_rate > 100:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Tax rate must be between 0 and 100",
+                )
+
+            # -------------------------------------------------
+            # 5. Create Product Variant linked to existing product
+            # -------------------------------------------------
+            variant = ProductVariant(
+                tenant_id=tenant_id,
+                product_id=product.id,
+                package_quantity=data.package_quantity,
+                unit=unit,
+                barcode=barcode,
+                sku=sku,
+                selling_price=data.selling_price,
+                offer_price=data.offer_price,
+                tax_rate=data.tax_rate,
+                stock_quantity=data.stock_quantity,
+                low_stock_threshold=data.low_stock_threshold,
+                status="ACTIVE",
+            )
+
+            await self.repository.create_variant(
+                db=db,
+                variant=variant,
+            )
+
+            # -------------------------------------------------
+            # 6. Audit Log
+            # -------------------------------------------------
+            from app.services.audit_service import log as audit_log
+            await audit_log(
+                db=db,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                action="PRODUCT_VARIANT_CREATED",
+                entity_type="product_variant",
+                entity_id=variant.id,
+                description=f"Variant added to product '{product.name}'",
+                new_values={
+                    "product_id": str(product.id),
+                    "barcode": variant.barcode,
+                    "sku": variant.sku,
+                    "selling_price": str(variant.selling_price),
+                    "offer_price": str(variant.offer_price) if variant.offer_price is not None else None,
+                    "tax_rate": str(variant.tax_rate),
+                    "stock_quantity": str(variant.stock_quantity),
+                    "low_stock_threshold": str(variant.low_stock_threshold),
+                    "unit": variant.unit,
+                    "package_quantity": str(variant.package_quantity),
+                },
+            )
+
+            # -------------------------------------------------
+            # 7. Commit changes and refresh
+            # -------------------------------------------------
+            await db.commit()
+            await db.refresh(variant)
+
+            return variant
+
+        except HTTPException:
+            await db.rollback()
+            raise
+
+        except IntegrityError as exc:
+            await db.rollback()
+            error_msg = str(exc.orig if hasattr(exc, "orig") else exc)
+            if "uq_product_variants_tenant_barcode" in error_msg or "barcode" in error_msg.lower():
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Barcode already exists: {barcode}",
+                )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A database conflict occurred while adding the product variant.",
+            )
+
+        except Exception as exc:
+            await db.rollback()
+            logger.error(
+                "Unexpected error adding variant to product %s: %s",
+                product_id,
+                exc,
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An internal server error occurred.",
+            )
 
     # =====================================================
     # GET PRODUCT BY ID

@@ -21,6 +21,8 @@ from app.schemas.product import (
     ProductResponse,
     ProductStockResponse,
     ProductUpdateResponse,
+    ProductVariantCreate,
+    ProductVariantResponse,
     ProductVariantUpdate,
     ProductVariantInventoryUpdate,
     ProductVariantInventoryResponse,
@@ -72,6 +74,35 @@ async def create_product(
             product_id=product.id
         )
     )
+
+
+# =========================================================
+# ADD PRODUCT VARIANT
+# =========================================================
+
+@router.post(
+    "/{product_id}/variants",
+    response_model=ProductVariantResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_product_variant(
+    product_id: UUID,
+    data: ProductVariantCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles(["OWNER", "MANAGER", "EMPLOYEE"])),
+):
+
+    tenant_id = current_user["tenant_id"]
+
+    variant = await product_service.add_variant(
+        db=db,
+        tenant_id=tenant_id,
+        user_id=current_user["user_id"],
+        product_id=product_id,
+        data=data,
+    )
+
+    return variant
 
 
 # =========================================================
