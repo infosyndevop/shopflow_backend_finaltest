@@ -21,7 +21,6 @@ from app.repositories.bill_repository import bill_repository
 from app.schemas.vegetable import (
     VegetableCreate,
     VegetableUpdate,
-    VegetableFullUpdate,
     VegetableQuickUpdate,
     VegetableBillCreate,
     VegetableResponse,
@@ -30,25 +29,25 @@ from app.schemas.vegetable import (
 router = APIRouter(prefix="/vegetables", tags=["Vegetables"])
 
 CENT = Decimal("0.01")
-THOUSANDTH = Decimal("0.001")
 ZERO = Decimal("0.00")
+KG_QUANT = Decimal("0.001")
 
 
-def money(value) -> Decimal:
-    return Decimal(str(value)).quantize(CENT, rounding=ROUND_HALF_UP)
+def money(value):
+    return Decimal(str(value)).quantize(
+        CENT, rounding=ROUND_HALF_UP
+    )
 
 
-def effective_price(row) -> Decimal:
-    """Use offer price whenever it is configured."""
-    price = (
+def effective_price(row):
+    return Decimal(str(
         row.offer_price_per_kg
         if row.offer_price_per_kg is not None
         else row.price_per_kg
-    )
-    return Decimal(str(price))
+    ))
 
 
-async def vegetable_response(db: AsyncSession, row):
+async def vegetable_response(db, row):
     product = await db.get(Product, row.product_id)
 
     return {
@@ -71,29 +70,9 @@ async def vegetable_response(db: AsyncSession, row):
     }
 
 
-# IMPORTANT: Static routes must be declared before /{vegetable_id}.
-
-@router.get("/low-stock", response_model=list[VegetableResponse])
-async def list_low_stock_vegetables(
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-):
-    """List active vegetables at or below their configured stock threshold."""
-    result = await db.execute(
-        select(VegetableItem).where(
-            VegetableItem.tenant_id == current_user["tenant_id"],
-            VegetableItem.status == "ACTIVE",
-            VegetableItem.stock_kg
-            <= VegetableItem.low_stock_threshold_kg,
-        ).order_by(
-            VegetableItem.stock_kg.asc(),
-            VegetableItem.created_at.desc(),
-        )
-    )
-
-    rows = result.scalars().all()
-    return [await vegetable_response(db, row) for row in rows]
-
+# ---------------------------------------------------------
+# CREATE VEGETABLE
+# ---------------------------------------------------------
 
 @router.post(
     "",
@@ -103,49 +82,48 @@ async def list_low_stock_vegetables(
 async def create_vegetable(
     data: VegetableCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(require_roles(["OWNER", "MANAGER","EMPLOYEE"])),
+    current_user: dict = Depends(
+        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
+    ),
 ):
-    """Create a product and its vegetable inventory record."""
     tenant_id = current_user["tenant_id"]
     name = data.name.strip()
 
-    if not name:
-        raise HTTPException(400, "Vegetable name is required.")
-
-    result = await db.execute(
-        select(Product).where(
-            Product.tenant_id == tenant_id,
-            func.lower(Product.name) == name.lower(),
-            Product.status == "ACTIVE",
-        )
-    )
-    product = result.scalar_one_or_none()
-
-    if product is not None:
-        variants = await db.execute(
-            select(func.count(ProductVariant.id)).where(
-                ProductVariant.product_id == product.id,
-                ProductVariant.tenant_id == tenant_id,
-            )
-        )
-        if variants.scalar_one() > 0:
-            raise HTTPException(
-                409,
-                "A product with this name already has variants. "
-                "Choose a different vegetable name.",
-            )
-
-        existing = await db.execute(
-            select(VegetableItem).where(
-                VegetableItem.tenant_id == tenant_id,
-                VegetableItem.product_id == product.id,
-            )
-        )
-        if existing.scalar_one_or_none() is not None:
-            raise HTTPException(409, "This vegetable already exists.")
-
     try:
-        if product is None:
+        existing_product_result = await db.execute(
+            select(Product).where(
+                Product.tenant_id == tenant_id,
+                func.lower(Product.name) == name.lower(),
+                Product.status == "ACTIVE",
+            )
+        )
+        product = existing_product_result.scalar_one_or_none()
+
+        if product is not None:
+            variant_result = await db.execute(
+                select(func.count(ProductVariant.id)).where(
+                    ProductVariant.tenant_id == tenant_id,
+                    ProductVariant.product_id == product.id,
+                )
+            )
+            if variant_result.scalar_one() > 0:
+                raise HTTPException(
+                    409,
+                    "This product already has variants. "
+                    "Use a different vegetable name.",
+                )
+
+            existing_vegetable_result = await db.execute(
+                select(VegetableItem).where(
+                    VegetableItem.tenant_id == tenant_id,
+                    VegetableItem.product_id == product.id,
+                )
+            )
+            if existing_vegetable_result.scalar_one_or_none():
+                raise HTTPException(
+                    409, "This vegetable already exists."
+                )
+        else:
             product = Product(
                 tenant_id=tenant_id,
                 name=name,
@@ -165,6 +143,7 @@ async def create_vegetable(
             low_stock_threshold_kg=data.low_stock_threshold_kg,
             status="ACTIVE",
         )
+
         db.add(row)
         await db.commit()
         await db.refresh(row)
@@ -176,7 +155,14 @@ async def create_vegetable(
         raise
 
 
-@router.get("", response_model=list[VegetableResponse])
+# ---------------------------------------------------------
+# LIST VEGETABLES
+# ---------------------------------------------------------
+
+@router.get(
+    "",
+    response_model=list[VegetableResponse],
+)
 async def list_vegetables(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -188,16 +174,172 @@ async def list_vegetables(
     )
 
     rows = result.scalars().all()
-    return [await vegetable_response(db, row) for row in rows]
+    return [
+        await vegetable_response(db, row)
+        for row in rows
+    ]
 
 
-@router.post("/bills", status_code=status.HTTP_201_CREATED)
+# ---------------------------------------------------------
+# LOW STOCK - MUST BE BEFORE /{vegetable_id}
+# ---------------------------------------------------------
+
+@router.get(
+    "/low-stock",
+    response_model=list[VegetableResponse],
+)
+async def get_low_stock_vegetables(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(VegetableItem).where(
+            VegetableItem.tenant_id == current_user["tenant_id"],
+            VegetableItem.status == "ACTIVE",
+            VegetableItem.stock_kg
+            <= VegetableItem.low_stock_threshold_kg,
+        ).order_by(VegetableItem.stock_kg.asc())
+    )
+
+    rows = result.scalars().all()
+    return [
+        await vegetable_response(db, row)
+        for row in rows
+    ]
+
+
+# ---------------------------------------------------------
+# QUICK UPDATE PRICE / OFFER / STOCK / THRESHOLD
+# ---------------------------------------------------------
+
+@router.patch(
+    "/{vegetable_id}/quick-update",
+    response_model=VegetableResponse,
+)
+async def quick_update_vegetable(
+    vegetable_id: UUID,
+    data: VegetableQuickUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(
+        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
+    ),
+):
+    result = await db.execute(
+        select(VegetableItem).where(
+            VegetableItem.id == vegetable_id,
+            VegetableItem.tenant_id == current_user["tenant_id"],
+        ).with_for_update()
+    )
+    row = result.scalar_one_or_none()
+
+    if row is None:
+        raise HTTPException(404, "Vegetable not found.")
+
+    values = data.model_dump(exclude_unset=True)
+
+    regular = Decimal(str(
+        values.get("price_per_kg", row.price_per_kg)
+    ))
+    offer = values.get(
+        "offer_price_per_kg",
+        row.offer_price_per_kg,
+    )
+
+    if offer is not None and Decimal(str(offer)) > regular:
+        raise HTTPException(
+            400, "Offer price cannot exceed regular price."
+        )
+
+    try:
+        for key, value in values.items():
+            setattr(row, key, value)
+
+        await db.commit()
+        await db.refresh(row)
+        return await vegetable_response(db, row)
+
+    except Exception:
+        await db.rollback()
+        raise
+
+
+# ---------------------------------------------------------
+# FULL DETAIL UPDATE
+# ---------------------------------------------------------
+
+@router.patch(
+    "/{vegetable_id}",
+    response_model=VegetableResponse,
+)
+async def update_vegetable(
+    vegetable_id: UUID,
+    data: VegetableUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(
+        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
+    ),
+):
+    result = await db.execute(
+        select(VegetableItem).where(
+            VegetableItem.id == vegetable_id,
+            VegetableItem.tenant_id == current_user["tenant_id"],
+        ).with_for_update()
+    )
+    row = result.scalar_one_or_none()
+
+    if row is None:
+        raise HTTPException(404, "Vegetable not found.")
+
+    values = data.model_dump(exclude_unset=True)
+
+    regular = Decimal(str(
+        values.get("price_per_kg", row.price_per_kg)
+    ))
+    offer = values.get(
+        "offer_price_per_kg",
+        row.offer_price_per_kg,
+    )
+
+    if offer is not None and Decimal(str(offer)) > regular:
+        raise HTTPException(
+            400, "Offer price cannot exceed regular price."
+        )
+
+    product = await db.get(Product, row.product_id)
+    if product is None or product.tenant_id != current_user["tenant_id"]:
+        raise HTTPException(404, "Vegetable product not found.")
+
+    try:
+        name = values.pop("name", None)
+        if name is not None:
+            product.name = name.strip()
+
+        for key, value in values.items():
+            if value is not None:
+                setattr(row, key, value)
+
+        await db.commit()
+        await db.refresh(row)
+        return await vegetable_response(db, row)
+
+    except Exception:
+        await db.rollback()
+        raise
+
+
+# ---------------------------------------------------------
+# CREATE WEIGHT-BASED VEGETABLE BILL
+# ---------------------------------------------------------
+
+@router.post(
+    "/bills",
+    status_code=status.HTTP_201_CREATED,
+)
 async def create_vegetable_bill(
     data: VegetableBillCreate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Create a weight-based vegetable bill using ShopFlow billing records."""
     tenant_id = current_user["tenant_id"]
     user_id = current_user["user_id"]
 
@@ -205,7 +347,9 @@ async def create_vegetable_bill(
     paid = money(data.paid_amount)
     discount = money(data.discount_amount)
 
-    customer_name = (data.customer_name or "").strip() or None
+    customer_name = (
+        (data.customer_name or "").strip() or None
+    )
     phone = (
         (data.customer_phone or "")
         .strip()
@@ -225,11 +369,11 @@ async def create_vegetable_bill(
 
     if phone and not re.fullmatch(r"[6-9][0-9]{9}", phone):
         raise HTTPException(
-            400,
-            "A valid 10-digit Indian phone number is required.",
+            400, "A valid 10-digit Indian phone number is required."
         )
 
     ids = [line.vegetable_id for line in data.items]
+
     if len(ids) != len(set(ids)):
         raise HTTPException(
             400,
@@ -250,14 +394,17 @@ async def create_vegetable_bill(
     )
 
     records = result.all()
+
     if len(records) != len(ids):
         raise HTTPException(
             400,
             "One or more vegetables were not found or are inactive.",
         )
 
-    by_id = {vegetable.id: (vegetable, product)
-             for vegetable, product in records}
+    by_id = {
+        vegetable.id: (vegetable, product)
+        for vegetable, product in records
+    }
 
     subtotal = ZERO
     tax_total = ZERO
@@ -267,17 +414,17 @@ async def create_vegetable_bill(
         vegetable, product = by_id[line.vegetable_id]
 
         weight = Decimal(str(line.weight_kg)).quantize(
-            THOUSANDTH,
+            KG_QUANT,
             rounding=ROUND_HALF_UP,
         )
 
         if weight <= 0:
             raise HTTPException(
-                400,
-                "Vegetable weight must be greater than zero.",
+                400, "Vegetable weight must be greater than zero."
             )
 
         stock = Decimal(str(vegetable.stock_kg))
+
         if stock < weight:
             raise HTTPException(
                 400,
@@ -285,7 +432,7 @@ async def create_vegetable_bill(
                 f"Available: {stock} kg.",
             )
 
-        # The offer price takes precedence over the regular price.
+        # Offer price is used whenever it is configured.
         price = effective_price(vegetable)
         gross = money(price * weight)
         rate = Decimal(str(vegetable.tax_rate or 0))
@@ -296,7 +443,10 @@ async def create_vegetable_bill(
         tax_total += tax
 
         prepared.append(
-            (vegetable, product, weight, gross, rate, tax, line_total, price)
+            (
+                vegetable, product, weight, price,
+                rate, tax, line_total,
+            )
         )
 
     subtotal = money(subtotal)
@@ -304,28 +454,24 @@ async def create_vegetable_bill(
 
     if discount > subtotal:
         raise HTTPException(
-            400,
-            "Discount cannot exceed vegetable subtotal.",
+            400, "Discount cannot exceed vegetable subtotal."
         )
 
     total = money(subtotal + tax_total - discount)
 
     if paid > total:
         raise HTTPException(
-            400,
-            "Paid amount cannot exceed final bill total.",
+            400, "Paid amount cannot exceed final bill total."
         )
 
     if method == "KADAN" and paid != ZERO:
         raise HTTPException(
-            400,
-            "KADAN payment requires paid_amount to be 0.",
+            400, "KADAN payment requires paid_amount to be 0."
         )
 
     if method in {"CASH", "UPI"} and total > ZERO and paid <= ZERO:
         raise HTTPException(
-            400,
-            f"{method} payment requires a positive paid amount.",
+            400, f"{method} payment requires a positive paid amount."
         )
 
     outstanding = money(max(total - paid, ZERO))
@@ -333,28 +479,38 @@ async def create_vegetable_bill(
     if outstanding > ZERO and (not customer_name or not phone):
         raise HTTPException(
             400,
-            f"Unpaid balance ₹{outstanding:.2f}; "
-            "customer name and phone are required for Kadan.",
+            "Customer name and phone are required for an unpaid balance.",
         )
 
     try:
         customer = None
+
         if phone:
             customer = await bill_repository.get_customer_by_phone(
                 db, tenant_id, phone
             )
+
             if customer is None:
                 customer = await bill_repository.create_customer(
                     db, tenant_id, customer_name, phone
                 )
 
-        latest = await bill_repository.get_latest_bill_number(db, tenant_id)
-        bill_number = f"BILL-{(latest or 0) + 1:06d}"
+        latest = await bill_repository.get_latest_bill_number(
+            db, tenant_id
+        )
+
+        if isinstance(latest, str):
+            try:
+                next_number = int(latest.split("-")[-1]) + 1
+            except (ValueError, AttributeError):
+                next_number = 1
+        else:
+            next_number = (latest or 0) + 1
 
         bill = Bill(
             tenant_id=tenant_id,
             customer_id=customer.id if customer else None,
-            bill_number=bill_number,
+            bill_number=f"BILL-{next_number:06d}",
             subtotal=subtotal,
             discount_amount=discount,
             tax_amount=tax_total,
@@ -365,7 +521,10 @@ async def create_vegetable_bill(
 
         await bill_repository.create_bill(db, bill)
 
-        for vegetable, product, weight, gross, rate, tax, line_total, price in prepared:
+        for (
+            vegetable, product, weight, price,
+            rate, tax, line_total,
+        ) in prepared:
             db.add(
                 BillItem(
                     bill_id=bill.id,
@@ -373,14 +532,17 @@ async def create_vegetable_bill(
                     product_variant_id=None,
                     item_name=product.name,
                     quantity=weight,
-                    unit_price=vegetable.price_per_kg,
-                    offer_price=vegetable.offer_price_per_kg,
+                    unit_price=price,
+                    offer_price=(
+                        vegetable.offer_price_per_kg
+                    ),
                     discount_amount=ZERO,
                     tax_rate=rate,
                     tax_amount=tax,
                     line_total=line_total,
                 )
             )
+
             vegetable.stock_kg = (
                 Decimal(str(vegetable.stock_kg)) - weight
             )
@@ -465,7 +627,9 @@ async def create_vegetable_bill(
                         "product_id": str(product.id),
                         "name": product.name,
                         "weight_kg": str(weight),
-                        "price_per_kg": str(vegetable.price_per_kg),
+                        "price_per_kg": str(
+                            vegetable.price_per_kg
+                        ),
                         "offer_price_per_kg": (
                             str(vegetable.offer_price_per_kg)
                             if vegetable.offer_price_per_kg is not None
@@ -477,8 +641,8 @@ async def create_vegetable_bill(
                         "line_total": str(line_total),
                     }
                     for (
-                        vegetable, product, weight, gross, rate,
-                        tax, line_total, price
+                        vegetable, product, weight, price,
+                        rate, tax, line_total,
                     ) in prepared
                 ],
             },
@@ -489,131 +653,14 @@ async def create_vegetable_bill(
         raise
 
 
-@router.put("/{vegetable_id}", response_model=VegetableResponse)
-async def full_update_vegetable(
-    vegetable_id: UUID,
-    data: VegetableFullUpdate,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(require_roles(["OWNER", "MANAGER","EMPLOYEE"])),
-):
-    result = await db.execute(
-        select(VegetableItem).where(
-            VegetableItem.id == vegetable_id,
-            VegetableItem.tenant_id == current_user["tenant_id"],
-        ).with_for_update()
-    )
+# ---------------------------------------------------------
+# GET BY UUID - KEEP THIS AFTER STATIC ROUTES
+# ---------------------------------------------------------
 
-    row = result.scalar_one_or_none()
-    if row is None:
-        raise HTTPException(404, "Vegetable not found.")
-
-    product = await db.get(Product, row.product_id)
-    if product is None or product.tenant_id != current_user["tenant_id"]:
-        raise HTTPException(404, "Vegetable product not found.")
-
-    values = data.model_dump()
-    product.name = values.pop("name")
-
-    for key, value in values.items():
-        setattr(row, key, value)
-
-    try:
-        await db.commit()
-        await db.refresh(row)
-        return await vegetable_response(db, row)
-    except Exception:
-        await db.rollback()
-        raise
-
-
-@router.patch("/{vegetable_id}/quick-update", response_model=VegetableResponse)
-async def quick_update_vegetable(
-    vegetable_id: UUID,
-    data: VegetableQuickUpdate,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(require_roles(["OWNER", "MANAGER","EMPLOYEE"])),
-):
-    result = await db.execute(
-        select(VegetableItem).where(
-            VegetableItem.id == vegetable_id,
-            VegetableItem.tenant_id == current_user["tenant_id"],
-        ).with_for_update()
-    )
-
-    row = result.scalar_one_or_none()
-    if row is None:
-        raise HTTPException(404, "Vegetable not found.")
-
-    values = data.model_dump(exclude_unset=True)
-
-    effective_regular = Decimal(
-        str(values.get("price_per_kg", row.price_per_kg))
-    )
-    effective_offer = values.get(
-        "offer_price_per_kg",
-        row.offer_price_per_kg,
-    )
-
-    if effective_offer is not None and Decimal(str(effective_offer)) > effective_regular:
-        raise HTTPException(
-            400,
-            "offer_price_per_kg must not exceed price_per_kg.",
-        )
-
-    try:
-        for key, value in values.items():
-            setattr(row, key, value)
-
-        await db.commit()
-        await db.refresh(row)
-        return await vegetable_response(db, row)
-    except Exception:
-        await db.rollback()
-        raise
-
-
-@router.patch("/{vegetable_id}", response_model=VegetableResponse)
-async def update_vegetable(
-    vegetable_id: UUID,
-    data: VegetableUpdate,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(require_roles(["OWNER", "MANAGER","EMPLOYEE"])),
-):
-    result = await db.execute(
-        select(VegetableItem).where(
-            VegetableItem.id == vegetable_id,
-            VegetableItem.tenant_id == current_user["tenant_id"],
-        ).with_for_update()
-    )
-
-    row = result.scalar_one_or_none()
-    if row is None:
-        raise HTTPException(404, "Vegetable not found.")
-
-    values = data.model_dump(exclude_unset=True)
-
-    regular = Decimal(str(values.get("price_per_kg", row.price_per_kg)))
-    offer = values.get("offer_price_per_kg", row.offer_price_per_kg)
-
-    if offer is not None and Decimal(str(offer)) > regular:
-        raise HTTPException(
-            400,
-            "offer_price_per_kg must not exceed price_per_kg.",
-        )
-
-    try:
-        for key, value in values.items():
-            setattr(row, key, value)
-
-        await db.commit()
-        await db.refresh(row)
-        return await vegetable_response(db, row)
-    except Exception:
-        await db.rollback()
-        raise
-
-
-@router.get("/{vegetable_id}", response_model=VegetableResponse)
+@router.get(
+    "/{vegetable_id}",
+    response_model=VegetableResponse,
+)
 async def get_vegetable(
     vegetable_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -627,6 +674,7 @@ async def get_vegetable(
     )
 
     row = result.scalar_one_or_none()
+
     if row is None:
         raise HTTPException(404, "Vegetable not found.")
 
