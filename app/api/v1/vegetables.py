@@ -1,10 +1,10 @@
 
-import re
 from decimal import Decimal, ROUND_HALF_UP
 from uuid import UUID
+import re
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -21,6 +21,7 @@ from app.repositories.bill_repository import bill_repository
 from app.schemas.vegetable import (
     VegetableCreate,
     VegetableUpdate,
+    VegetableQuickUpdate,
     VegetableBillCreate,
     VegetableResponse,
 )
@@ -28,30 +29,24 @@ from app.schemas.vegetable import (
 router = APIRouter(prefix="/vegetables", tags=["Vegetables"])
 
 CENT = Decimal("0.01")
-MILLI = Decimal("0.001")
+THREE_DP = Decimal("0.001")
 ZERO = Decimal("0.00")
 
 
 def money(value) -> Decimal:
     return Decimal(str(value)).quantize(
-        CENT,
-        rounding=ROUND_HALF_UP,
+        CENT, rounding=ROUND_HALF_UP
     )
 
 
-def effective_price(row: VegetableItem) -> Decimal:
-    offer = row.offer_price_per_kg
-
-    if offer is not None:
-        return money(offer)
-
-    return money(row.price_per_kg)
+def effective_price(vegetable: VegetableItem) -> Decimal:
+    """Use the offer price when present; otherwise use regular price."""
+    if vegetable.offer_price_per_kg is not None:
+        return Decimal(str(vegetable.offer_price_per_kg))
+    return Decimal(str(vegetable.price_per_kg))
 
 
-async def vegetable_response(
-    db: AsyncSession,
-    row: VegetableItem,
-) -> dict:
+async def vegetable_response(db, row: VegetableItem) -> dict:
     product = await db.get(Product, row.product_id)
 
     return {
@@ -64,10 +59,39 @@ async def vegetable_response(
         "effective_price_per_kg": effective_price(row),
         "tax_rate": row.tax_rate,
         "stock_kg": row.stock_kg,
+        "low_stock_threshold_kg": row.low_stock_threshold_kg,
+        "is_low_stock": (
+            Decimal(str(row.stock_kg))
+            <= Decimal(str(row.low_stock_threshold_kg))
+        ),
         "status": row.status,
         "created_at": row.created_at,
     }
 
+
+async def get_tenant_vegetable(
+    db: AsyncSession,
+    tenant_id,
+    vegetable_id: UUID,
+    *,
+    lock: bool = False,
+):
+    query = select(VegetableItem).where(
+        VegetableItem.id == vegetable_id,
+        VegetableItem.tenant_id == tenant_id,
+    )
+
+    if lock:
+        query = query.with_for_update()
+
+    result = await db.execute(query)
+    return result.scalar_one_or_none()
+
+
+# ---------------------------------------------------------
+# CREATE VEGETABLE
+# POST /api/v1/vegetables
+# ---------------------------------------------------------
 
 @router.post(
     "",
@@ -81,59 +105,54 @@ async def create_vegetable(
         require_roles(["OWNER", "MANAGER"])
     ),
 ):
-    """Create a canonical ShopFlow product and its vegetable record."""
-
     tenant_id = current_user["tenant_id"]
     name = data.name.strip()
 
+    if not name:
+        raise HTTPException(422, "Vegetable name cannot be empty.")
+
+    if (
+        data.offer_price_per_kg is not None
+        and data.offer_price_per_kg > data.price_per_kg
+    ):
+        raise HTTPException(
+            422,
+            "Offer price cannot exceed regular price.",
+        )
+
     try:
-        duplicate_result = await db.execute(
-            select(Product.id)
+        # Prevent duplicate vegetable names within this shop.
+        existing_result = await db.execute(
+            select(Product)
             .join(
                 VegetableItem,
                 VegetableItem.product_id == Product.id,
             )
             .where(
-                Product.tenant_id == tenant_id,
                 VegetableItem.tenant_id == tenant_id,
+                Product.tenant_id == tenant_id,
                 func.lower(Product.name) == name.lower(),
             )
-            .limit(1)
         )
 
-        if duplicate_result.scalar_one_or_none() is not None:
+        if existing_result.scalars().first() is not None:
             raise HTTPException(
-                status_code=409,
-                detail="This vegetable already exists in your shop.",
+                409,
+                "A vegetable with this name already exists.",
             )
 
+        # Do not reuse a standard product or a product with variants.
+        # Vegetables have their own weight-based stock and pricing.
         product = Product(
             tenant_id=tenant_id,
-            category_id=None,
             name=name,
-            description="Weight-based vegetable product",
+            description="Weight-based vegetable",
             status="ACTIVE",
         )
-
         db.add(product)
         await db.flush()
 
-        # Keep the existing rule that weight-based vegetables do not use
-        # packaged product variants.
-        variant_result = await db.execute(
-            select(func.count(ProductVariant.id)).where(
-                ProductVariant.product_id == product.id,
-                ProductVariant.tenant_id == tenant_id,
-            )
-        )
-
-        if variant_result.scalar_one() > 0:
-            raise HTTPException(
-                status_code=409,
-                detail="A vegetable cannot use package variants.",
-            )
-
-        row = VegetableItem(
+        vegetable = VegetableItem(
             tenant_id=tenant_id,
             product_id=product.id,
             unit=data.unit,
@@ -141,14 +160,15 @@ async def create_vegetable(
             offer_price_per_kg=data.offer_price_per_kg,
             tax_rate=data.tax_rate,
             stock_kg=data.stock_kg,
+            low_stock_threshold_kg=data.low_stock_threshold_kg,
             status="ACTIVE",
         )
 
-        db.add(row)
+        db.add(vegetable)
         await db.commit()
-        await db.refresh(row)
+        await db.refresh(vegetable)
 
-        return await vegetable_response(db, row)
+        return await vegetable_response(db, vegetable)
 
     except HTTPException:
         await db.rollback()
@@ -158,16 +178,22 @@ async def create_vegetable(
         raise
 
 
-@router.get("", response_model=list[VegetableResponse])
+# ---------------------------------------------------------
+# LIST / SEARCH VEGETABLES
+# GET /api/v1/vegetables
+# GET /api/v1/vegetables?search=tomato
+# ---------------------------------------------------------
+
+@router.get(
+    "",
+    response_model=list[VegetableResponse],
+)
 async def list_vegetables(
     search: str | None = Query(default=None, max_length=200),
+    active_only: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """List active vegetables or search them by name."""
-
-    tenant_id = current_user["tenant_id"]
-
     query = (
         select(VegetableItem)
         .join(
@@ -175,19 +201,22 @@ async def list_vegetables(
             Product.id == VegetableItem.product_id,
         )
         .where(
-            VegetableItem.tenant_id == tenant_id,
-            Product.tenant_id == tenant_id,
-            VegetableItem.status == "ACTIVE",
-            Product.status == "ACTIVE",
+            VegetableItem.tenant_id == current_user["tenant_id"],
+            Product.tenant_id == current_user["tenant_id"],
         )
     )
 
-    if search and search.strip():
+    if active_only:
         query = query.where(
-            Product.name.ilike(f"%{search.strip()}%")
+            VegetableItem.status == "ACTIVE",
+            Product.status == "ACTIVE",
         )
 
-    query = query.order_by(Product.name.asc())
+    if search and search.strip():
+        pattern = f"%{search.strip()}%"
+        query = query.where(Product.name.ilike(pattern))
+
+    query = query.order_by(VegetableItem.created_at.desc())
 
     result = await db.execute(query)
     rows = result.scalars().all()
@@ -197,6 +226,227 @@ async def list_vegetables(
         for row in rows
     ]
 
+
+# ---------------------------------------------------------
+# GET ONE VEGETABLE
+# GET /api/v1/vegetables/{vegetable_id}
+# ---------------------------------------------------------
+
+@router.get(
+    "/{vegetable_id}",
+    response_model=VegetableResponse,
+)
+async def get_vegetable(
+    vegetable_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    row = await get_tenant_vegetable(
+        db,
+        current_user["tenant_id"],
+        vegetable_id,
+    )
+
+    if row is None:
+        raise HTTPException(404, "Vegetable not found.")
+
+    return await vegetable_response(db, row)
+
+
+# ---------------------------------------------------------
+# LOW-STOCK VEGETABLES
+# GET /api/v1/vegetables/low-stock
+# ---------------------------------------------------------
+
+@router.get(
+    "/low-stock",
+    response_model=list[VegetableResponse],
+)
+async def get_low_stock_vegetables(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    result = await db.execute(
+        select(VegetableItem)
+        .join(
+            Product,
+            Product.id == VegetableItem.product_id,
+        )
+        .where(
+            VegetableItem.tenant_id == current_user["tenant_id"],
+            Product.tenant_id == current_user["tenant_id"],
+            VegetableItem.status == "ACTIVE",
+            Product.status == "ACTIVE",
+            VegetableItem.stock_kg
+            <= VegetableItem.low_stock_threshold_kg,
+        )
+        .order_by(VegetableItem.stock_kg.asc())
+    )
+
+    rows = result.scalars().all()
+
+    return [
+        await vegetable_response(db, row)
+        for row in rows
+    ]
+
+
+# ---------------------------------------------------------
+# FULL-DETAIL EDIT
+# PUT /api/v1/vegetables/{vegetable_id}
+# ---------------------------------------------------------
+
+@router.put(
+    "/{vegetable_id}",
+    response_model=VegetableResponse,
+)
+async def edit_vegetable(
+    vegetable_id: UUID,
+    data: VegetableUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(
+        require_roles(["OWNER", "MANAGER"])
+    ),
+):
+    row = await get_tenant_vegetable(
+        db,
+        current_user["tenant_id"],
+        vegetable_id,
+        lock=True,
+    )
+
+    if row is None:
+        raise HTTPException(404, "Vegetable not found.")
+
+    product = await db.get(Product, row.product_id)
+
+    if product is None or product.tenant_id != current_user["tenant_id"]:
+        raise HTTPException(404, "Linked product not found.")
+
+    changes = data.model_dump(exclude_unset=True)
+
+    # Explicit null removes an offer price.
+    if "offer_price_per_kg" in changes:
+        row.offer_price_per_kg = changes.pop(
+            "offer_price_per_kg"
+        )
+
+    if "name" in changes:
+        name = changes.pop("name")
+        if name is not None:
+            name = name.strip()
+
+            duplicate_result = await db.execute(
+                select(Product.id)
+                .join(
+                    VegetableItem,
+                    VegetableItem.product_id == Product.id,
+                )
+                .where(
+                    VegetableItem.tenant_id == current_user["tenant_id"],
+                    Product.tenant_id == current_user["tenant_id"],
+                    Product.id != product.id,
+                    func.lower(Product.name) == name.lower(),
+                )
+                .limit(1)
+            )
+
+            if duplicate_result.scalar_one_or_none() is not None:
+                raise HTTPException(
+                    409,
+                    "Another vegetable already uses this name.",
+                )
+
+            product.name = name
+
+    for field, value in changes.items():
+        if value is not None:
+            setattr(row, field, value)
+
+    if (
+        row.offer_price_per_kg is not None
+        and row.offer_price_per_kg > row.price_per_kg
+    ):
+        await db.rollback()
+        raise HTTPException(
+            422,
+            "Offer price cannot exceed regular price.",
+        )
+
+    try:
+        await db.commit()
+        await db.refresh(row)
+        return await vegetable_response(db, row)
+    except Exception:
+        await db.rollback()
+        raise
+
+
+# ---------------------------------------------------------
+# QUICK UPDATE
+# PATCH /api/v1/vegetables/{vegetable_id}/quick-update
+# ---------------------------------------------------------
+
+@router.patch(
+    "/{vegetable_id}/quick-update",
+    response_model=VegetableResponse,
+)
+async def quick_update_vegetable(
+    vegetable_id: UUID,
+    data: VegetableQuickUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(
+        require_roles(["OWNER", "MANAGER"])
+    ),
+):
+    changes = data.model_dump(exclude_unset=True)
+
+    if not changes:
+        raise HTTPException(
+            422,
+            "Provide at least one field to update.",
+        )
+
+    row = await get_tenant_vegetable(
+        db,
+        current_user["tenant_id"],
+        vegetable_id,
+        lock=True,
+    )
+
+    if row is None:
+        raise HTTPException(404, "Vegetable not found.")
+
+    for field, value in changes.items():
+        # null is allowed to clear an offer price only.
+        if field == "offer_price_per_kg":
+            row.offer_price_per_kg = value
+        elif value is not None:
+            setattr(row, field, value)
+
+    if (
+        row.offer_price_per_kg is not None
+        and row.offer_price_per_kg > row.price_per_kg
+    ):
+        await db.rollback()
+        raise HTTPException(
+            422,
+            "Offer price cannot exceed regular price.",
+        )
+
+    try:
+        await db.commit()
+        await db.refresh(row)
+        return await vegetable_response(db, row)
+    except Exception:
+        await db.rollback()
+        raise
+
+
+# ---------------------------------------------------------
+# PARTIAL UPDATE (BACKWARD COMPATIBILITY)
+# PATCH /api/v1/vegetables/{vegetable_id}
+# ---------------------------------------------------------
 
 @router.patch(
     "/{vegetable_id}",
@@ -210,51 +460,59 @@ async def update_vegetable(
         require_roles(["OWNER", "MANAGER"])
     ),
 ):
-    """Update pricing, offer price, stock, tax or status."""
-
-    result = await db.execute(
-        select(VegetableItem)
-        .where(
-            VegetableItem.id == vegetable_id,
-            VegetableItem.tenant_id == current_user["tenant_id"],
-        )
-        .with_for_update()
+    row = await get_tenant_vegetable(
+        db,
+        current_user["tenant_id"],
+        vegetable_id,
+        lock=True,
     )
-
-    row = result.scalar_one_or_none()
 
     if row is None:
         raise HTTPException(404, "Vegetable not found.")
 
     changes = data.model_dump(exclude_unset=True)
 
-    regular = changes.get("price_per_kg", row.price_per_kg)
+    if "name" in changes:
+        # Product name lives on the linked canonical product.
+        name = changes.pop("name")
+        if name is not None:
+            product = await db.get(Product, row.product_id)
+            if product is None:
+                raise HTTPException(404, "Linked product not found.")
+            product.name = name.strip()
 
-    # Explicit null clears the offer price.
-    offer = changes.get(
-        "offer_price_per_kg",
-        row.offer_price_per_kg,
-    )
+    for field, value in changes.items():
+        if field == "offer_price_per_kg":
+            row.offer_price_per_kg = value
+        elif value is not None:
+            setattr(row, field, value)
 
-    if offer is not None and offer > regular:
+    if (
+        row.offer_price_per_kg is not None
+        and row.offer_price_per_kg > row.price_per_kg
+    ):
+        await db.rollback()
         raise HTTPException(
             422,
             "Offer price cannot exceed regular price.",
         )
 
     try:
-        for key, value in changes.items():
-            setattr(row, key, value)
-
         await db.commit()
         await db.refresh(row)
-
         return await vegetable_response(db, row)
-
     except Exception:
         await db.rollback()
         raise
 
+
+# ---------------------------------------------------------
+# CREATE VEGETABLE BILL
+# POST /api/v1/vegetables/bills
+#
+# Uses the existing ShopFlow Bill, BillItem, Payment, and
+# Kadan tables/repository.
+# ---------------------------------------------------------
 
 @router.post(
     "/bills",
@@ -265,21 +523,21 @@ async def create_vegetable_bill(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
-    """Create a ShopFlow bill using weight-based vegetable items."""
-
     tenant_id = current_user["tenant_id"]
     user_id = current_user["user_id"]
 
-    method = data.payment_method.upper()
+    method = data.payment_method.strip().upper()
     paid = money(data.paid_amount)
     discount = money(data.discount_amount)
 
     customer_name = (data.customer_name or "").strip() or None
-    phone = re.sub(
-        r"[\s()-]",
-        "",
-        (data.customer_phone or "").strip(),
-    ) or None
+    phone = (
+        (data.customer_phone or "")
+        .strip()
+        .replace(" ", "")
+        .replace("-", "")
+        or None
+    )
 
     if phone and phone.startswith("+91"):
         phone = phone[3:]
@@ -296,10 +554,16 @@ async def create_vegetable_bill(
             "A valid 10-digit Indian phone number is required.",
         )
 
-    if discount > ZERO and not (customer_name and phone):
+    if discount > ZERO and (not customer_name or not phone):
         raise HTTPException(
             400,
             "Customer name and phone are required when a discount is applied.",
+        )
+
+    if method not in {"CASH", "UPI", "KADAN"}:
+        raise HTTPException(
+            400,
+            "Payment method must be CASH, UPI, or KADAN.",
         )
 
     ids = [line.vegetable_id for line in data.items]
@@ -307,7 +571,7 @@ async def create_vegetable_bill(
     if len(ids) != len(set(ids)):
         raise HTTPException(
             400,
-            "Duplicate vegetable lines are not allowed. Combine their weights.",
+            "Duplicate vegetable lines are not allowed; combine their weight.",
         )
 
     try:
@@ -347,13 +611,15 @@ async def create_vegetable_bill(
         for line in data.items:
             vegetable, product = by_id[line.vegetable_id]
 
-            raw_weight = Decimal(str(line.weight_kg))
-            weight = raw_weight.quantize(MILLI)
+            weight = Decimal(str(line.weight_kg)).quantize(
+                THREE_DP,
+                rounding=ROUND_HALF_UP,
+            )
 
-            if raw_weight != weight or weight <= 0:
+            if weight <= 0:
                 raise HTTPException(
                     400,
-                    "Weight must be positive with at most three decimal places.",
+                    "Vegetable weight must be greater than zero.",
                 )
 
             stock = Decimal(str(vegetable.stock_kg))
@@ -365,30 +631,28 @@ async def create_vegetable_bill(
                     f"Available: {stock} kg.",
                 )
 
-            unit_price = effective_price(vegetable)
-            gross = money(unit_price * weight)
+            # IMPORTANT: charge the offer price when configured.
+            price = effective_price(vegetable)
+            gross = money(price * weight)
 
-            tax_rate = Decimal(str(vegetable.tax_rate or 0))
-            tax = money(
-                gross * tax_rate / Decimal("100")
-            )
-
+            rate = Decimal(str(vegetable.tax_rate or 0))
+            tax = money(gross * rate / Decimal("100"))
             line_total = money(gross + tax)
 
             subtotal += gross
             tax_total += tax
 
             prepared.append(
-                {
-                    "vegetable": vegetable,
-                    "product": product,
-                    "weight": weight,
-                    "unit_price": unit_price,
-                    "gross": gross,
-                    "tax_rate": tax_rate,
-                    "tax": tax,
-                    "line_total": line_total,
-                }
+                (
+                    vegetable,
+                    product,
+                    weight,
+                    price,
+                    gross,
+                    rate,
+                    tax,
+                    line_total,
+                )
             )
 
         subtotal = money(subtotal)
@@ -397,7 +661,7 @@ async def create_vegetable_bill(
         if discount > subtotal:
             raise HTTPException(
                 400,
-                "Discount cannot exceed the vegetable subtotal.",
+                "Discount cannot exceed vegetable subtotal.",
             )
 
         total = money(subtotal + tax_total - discount)
@@ -405,13 +669,13 @@ async def create_vegetable_bill(
         if paid > total:
             raise HTTPException(
                 400,
-                "Paid amount cannot exceed the bill total.",
+                "Paid amount cannot exceed final bill total.",
             )
 
         if method == "KADAN" and paid != ZERO:
             raise HTTPException(
                 400,
-                "KADAN payment requires paid_amount to be zero.",
+                "KADAN payment requires paid_amount to be 0.",
             )
 
         if method in {"CASH", "UPI"} and total > ZERO and paid <= ZERO:
@@ -422,10 +686,11 @@ async def create_vegetable_bill(
 
         outstanding = money(max(total - paid, ZERO))
 
-        if outstanding > ZERO and not (customer_name and phone):
+        if outstanding > ZERO and (not customer_name or not phone):
             raise HTTPException(
                 400,
-                "Customer name and phone are required for an unpaid balance.",
+                f"Unpaid balance ₹{outstanding:.2f}; "
+                "customer name and phone are required for Kadan.",
             )
 
         customer = None
@@ -466,30 +731,39 @@ async def create_vegetable_bill(
 
         await bill_repository.create_bill(db, bill)
 
-        for item in prepared:
-            vegetable = item["vegetable"]
-
-            bill_item = BillItem(
-                bill_id=bill.id,
-                product_id=item["product"].id,
-                product_variant_id=None,
-                item_name=item["product"].name,
-                quantity=item["weight"],
-                unit_price=item["unit_price"],
-                offer_price=(
-                    vegetable.offer_price_per_kg
-                ),
-                discount_amount=ZERO,
-                tax_rate=item["tax_rate"],
-                tax_amount=item["tax"],
-                line_total=item["line_total"],
+        for (
+            vegetable,
+            product,
+            weight,
+            price,
+            gross,
+            rate,
+            tax,
+            line_total,
+        ) in prepared:
+            db.add(
+                BillItem(
+                    bill_id=bill.id,
+                    product_id=product.id,
+                    product_variant_id=None,
+                    item_name=product.name,
+                    quantity=weight,
+                    unit_price=vegetable.price_per_kg,
+                    offer_price=(
+                        vegetable.offer_price_per_kg
+                        if vegetable.offer_price_per_kg is not None
+                        else None
+                    ),
+                    discount_amount=ZERO,
+                    tax_rate=rate,
+                    tax_amount=tax,
+                    line_total=line_total,
+                )
             )
 
-            db.add(bill_item)
-
+            # Reduce the weight-based stock inside this transaction.
             vegetable.stock_kg = (
-                Decimal(str(vegetable.stock_kg))
-                - item["weight"]
+                Decimal(str(vegetable.stock_kg)) - weight
             )
 
         if paid > ZERO:
@@ -533,17 +807,17 @@ async def create_vegetable_bill(
             account.outstanding_amount = new_balance
             account.status = "ACTIVE"
 
-            db.add(
-                KadanTransaction(
-                    tenant_id=tenant_id,
-                    kadan_account_id=account.id,
-                    bill_id=bill.id,
-                    transaction_type="CREDIT",
-                    amount=outstanding,
-                    balance_after=new_balance,
-                    created_by=user_id,
-                )
+            transaction = KadanTransaction(
+                tenant_id=tenant_id,
+                kadan_account_id=account.id,
+                bill_id=bill.id,
+                transaction_type="CREDIT",
+                amount=outstanding,
+                balance_after=new_balance,
+                created_by=user_id,
             )
+
+            db.add(transaction)
 
             kadan_summary = {
                 "kadan_amount": str(outstanding),
@@ -569,26 +843,33 @@ async def create_vegetable_bill(
                 "kadan": kadan_summary,
                 "items": [
                     {
-                        "vegetable_id": str(item["vegetable"].id),
-                        "product_id": str(item["product"].id),
-                        "name": item["product"].name,
-                        "weight_kg": str(item["weight"]),
+                        "vegetable_id": str(vegetable.id),
+                        "product_id": str(product.id),
+                        "name": product.name,
+                        "weight_kg": str(weight),
                         "regular_price_per_kg": str(
-                            item["vegetable"].price_per_kg
+                            vegetable.price_per_kg
                         ),
                         "offer_price_per_kg": (
-                            str(item["vegetable"].offer_price_per_kg)
-                            if item["vegetable"].offer_price_per_kg is not None
+                            str(vegetable.offer_price_per_kg)
+                            if vegetable.offer_price_per_kg is not None
                             else None
                         ),
-                        "effective_price_per_kg": str(
-                            item["unit_price"]
-                        ),
-                        "tax_rate": str(item["tax_rate"]),
-                        "tax_amount": str(item["tax"]),
-                        "line_total": str(item["line_total"]),
+                        "charged_price_per_kg": str(price),
+                        "tax_rate": str(rate),
+                        "tax_amount": str(tax),
+                        "line_total": str(line_total),
                     }
-                    for item in prepared
+                    for (
+                        vegetable,
+                        product,
+                        weight,
+                        price,
+                        gross,
+                        rate,
+                        tax,
+                        line_total,
+                    ) in prepared
                 ],
             },
         }

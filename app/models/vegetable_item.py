@@ -1,4 +1,3 @@
-
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -18,7 +17,7 @@ from app.core.database import Base
 
 
 class VegetableItem(Base):
-    """Weight-based pricing and stock for a ShopFlow product."""
+    """Weight-based vegetable pricing, stock, and low-stock threshold."""
 
     __tablename__ = "vegetable_items"
 
@@ -54,7 +53,6 @@ class VegetableItem(Base):
         String(20),
         nullable=False,
         default="kg",
-        server_default="kg",
     )
 
     price_per_kg: Mapped[Decimal] = mapped_column(
@@ -65,28 +63,31 @@ class VegetableItem(Base):
     offer_price_per_kg: Mapped[Decimal | None] = mapped_column(
         Numeric(12, 2),
         nullable=True,
-        default=None,
     )
 
     tax_rate: Mapped[Decimal] = mapped_column(
         Numeric(5, 2),
         nullable=False,
         default=Decimal("0.00"),
-        server_default="0.00",
     )
 
     stock_kg: Mapped[Decimal] = mapped_column(
         Numeric(12, 3),
         nullable=False,
         default=Decimal("0.000"),
-        server_default="0.000",
+    )
+
+    low_stock_threshold_kg: Mapped[Decimal] = mapped_column(
+        Numeric(12, 3),
+        nullable=False,
+        default=Decimal("5.000"),
+        server_default="5.000",
     )
 
     status: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
         default="ACTIVE",
-        server_default="ACTIVE",
         index=True,
     )
 
