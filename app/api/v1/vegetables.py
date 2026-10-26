@@ -305,7 +305,7 @@ async def edit_vegetable(
     data: VegetableUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(
-        require_roles(["OWNER", "MANAGER"])
+        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
     ),
 ):
     row = await get_tenant_vegetable(
