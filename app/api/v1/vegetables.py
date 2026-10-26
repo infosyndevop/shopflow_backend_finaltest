@@ -102,7 +102,7 @@ async def create_vegetable(
     data: VegetableCreate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(
-        require_roles(["OWNER", "MANAGER"])
+        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
     ),
 ):
     tenant_id = current_user["tenant_id"]
