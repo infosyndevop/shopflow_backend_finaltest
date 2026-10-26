@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
-    CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:8000,https://shopflow.cryvex.in"
+    CORS_ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:8000,https://shopflow.cryvex.in/,https://shopflow-cryvex.netlify.app/"
     LOG_LEVEL: str = "INFO"
 
     # Service token for internal CRYVEX Cloud backend communication
