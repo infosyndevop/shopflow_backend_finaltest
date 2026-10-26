@@ -396,7 +396,7 @@ async def quick_update_vegetable(
     data: VegetableQuickUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(
-        require_roles(["OWNER", "MANAGER"])
+        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
     ),
 ):
     changes = data.model_dump(exclude_unset=True)
@@ -457,7 +457,7 @@ async def update_vegetable(
     data: VegetableUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(
-        require_roles(["OWNER", "MANAGER"])
+        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
     ),
 ):
     row = await get_tenant_vegetable(
