@@ -1,10 +1,10 @@
-
 from decimal import Decimal, ROUND_HALF_UP
+from datetime import date, datetime, time, timedelta
 from uuid import UUID
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select, func
+from sqlalchemy import select, func, cast, Date
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -15,6 +15,7 @@ from app.models.vegetable_item import VegetableItem
 from app.models.bill import Bill
 from app.models.bill_item import BillItem
 from app.models.payment import Payment
+from app.models.customer import Customer
 from app.models.kadan_account import KadanAccount
 from app.models.kadan_transaction import KadanTransaction
 from app.repositories.bill_repository import bill_repository
@@ -83,7 +84,7 @@ async def create_vegetable(
     data: VegetableCreate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(
-        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
+        require_roles(["OWNER", "MANAGER", "EMPLOYEE"])
     ),
 ):
     tenant_id = current_user["tenant_id"]
@@ -159,10 +160,7 @@ async def create_vegetable(
 # LIST VEGETABLES
 # ---------------------------------------------------------
 
-@router.get(
-    "",
-    response_model=list[VegetableResponse],
-)
+@router.get("", response_model=list[VegetableResponse])
 async def list_vegetables(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -181,7 +179,8 @@ async def list_vegetables(
 
 
 # ---------------------------------------------------------
-# LOW STOCK - MUST BE BEFORE /{vegetable_id}
+# LOW STOCK
+# Keep this static route before /{vegetable_id}
 # ---------------------------------------------------------
 
 @router.get(
@@ -209,7 +208,7 @@ async def get_low_stock_vegetables(
 
 
 # ---------------------------------------------------------
-# QUICK UPDATE PRICE / OFFER / STOCK / THRESHOLD
+# QUICK UPDATE
 # ---------------------------------------------------------
 
 @router.patch(
@@ -221,7 +220,7 @@ async def quick_update_vegetable(
     data: VegetableQuickUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(
-        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
+        require_roles(["OWNER", "MANAGER", "EMPLOYEE"])
     ),
 ):
     result = await db.execute(
@@ -276,7 +275,7 @@ async def update_vegetable(
     data: VegetableUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(
-        require_roles(["OWNER", "MANAGER","EMPLOYEE"])
+        require_roles(["OWNER", "MANAGER", "EMPLOYEE"])
     ),
 ):
     result = await db.execute(
@@ -432,7 +431,6 @@ async def create_vegetable_bill(
                 f"Available: {stock} kg.",
             )
 
-        # Offer price is used whenever it is configured.
         price = effective_price(vegetable)
         gross = money(price * weight)
         rate = Decimal(str(vegetable.tax_rate or 0))
@@ -533,9 +531,7 @@ async def create_vegetable_bill(
                     item_name=product.name,
                     quantity=weight,
                     unit_price=price,
-                    offer_price=(
-                        vegetable.offer_price_per_kg
-                    ),
+                    offer_price=vegetable.offer_price_per_kg,
                     discount_amount=ZERO,
                     tax_rate=rate,
                     tax_amount=tax,
@@ -627,9 +623,7 @@ async def create_vegetable_bill(
                         "product_id": str(product.id),
                         "name": product.name,
                         "weight_kg": str(weight),
-                        "price_per_kg": str(
-                            vegetable.price_per_kg
-                        ),
+                        "price_per_kg": str(vegetable.price_per_kg),
                         "offer_price_per_kg": (
                             str(vegetable.offer_price_per_kg)
                             if vegetable.offer_price_per_kg is not None
@@ -654,7 +648,256 @@ async def create_vegetable_bill(
 
 
 # ---------------------------------------------------------
-# GET BY UUID - KEEP THIS AFTER STATIC ROUTES
+# VEGETABLE BILL HISTORY + SUMMARY
+# GET /api/v1/vegetables/bills/history
+# Keep this static route before /{vegetable_id}
+# ---------------------------------------------------------
+
+@router.get("/bills/history")
+async def vegetable_bill_history(
+    start_date: date | None = None,
+    end_date: date | None = None,
+    page: int = 1,
+    page_size: int = 20,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return vegetable bills, sales, payments and credit summary."""
+
+    tenant_id = current_user["tenant_id"]
+
+    if page < 1:
+        raise HTTPException(400, "page must be at least 1.")
+
+    if page_size < 1 or page_size > 100:
+        raise HTTPException(400, "page_size must be between 1 and 100.")
+
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(400, "start_date cannot be after end_date.")
+
+    vegetable_product_ids = (
+        select(VegetableItem.product_id)
+        .where(VegetableItem.tenant_id == tenant_id)
+    )
+
+    vegetable_bill_ids = (
+        select(BillItem.bill_id)
+        .where(BillItem.product_id.in_(vegetable_product_ids))
+        .distinct()
+    )
+
+    filters = [
+        Bill.tenant_id == tenant_id,
+        Bill.id.in_(vegetable_bill_ids),
+    ]
+
+    if start_date:
+        filters.append(
+            Bill.created_at >= datetime.combine(start_date, time.min)
+        )
+
+    if end_date:
+        filters.append(
+            Bill.created_at < datetime.combine(
+                end_date + timedelta(days=1), time.min
+            )
+        )
+
+    payment_totals = (
+        select(
+            Payment.bill_id.label("bill_id"),
+            func.coalesce(func.sum(Payment.amount), 0).label("paid_amount"),
+        )
+        .where(
+            Payment.tenant_id == tenant_id,
+            Payment.status == "COMPLETED",
+        )
+        .group_by(Payment.bill_id)
+        .subquery()
+    )
+
+    credit_totals = (
+        select(
+            KadanTransaction.bill_id.label("bill_id"),
+            func.coalesce(func.sum(KadanTransaction.amount), 0).label("credit_amount"),
+        )
+        .where(
+            KadanTransaction.tenant_id == tenant_id,
+            KadanTransaction.transaction_type == "CREDIT",
+            KadanTransaction.bill_id.is_not(None),
+        )
+        .group_by(KadanTransaction.bill_id)
+        .subquery()
+    )
+
+    summary_result = await db.execute(
+        select(
+            func.count(Bill.id).label("bill_count"),
+            func.coalesce(func.sum(Bill.total_amount), 0).label("total_sales"),
+            func.coalesce(func.sum(payment_totals.c.paid_amount), 0).label("total_paid"),
+            func.coalesce(func.sum(credit_totals.c.credit_amount), 0).label("total_credit"),
+        )
+        .select_from(Bill)
+        .outerjoin(payment_totals, payment_totals.c.bill_id == Bill.id)
+        .outerjoin(credit_totals, credit_totals.c.bill_id == Bill.id)
+        .where(*filters)
+    )
+
+    summary = summary_result.one()
+
+    today = date.today()
+
+    today_filters = [
+        Bill.tenant_id == tenant_id,
+        Bill.id.in_(vegetable_bill_ids),
+        cast(Bill.created_at, Date) == today,
+    ]
+
+    today_result = await db.execute(
+        select(
+            func.coalesce(func.sum(Bill.total_amount), 0).label("today_sales"),
+            func.coalesce(func.sum(credit_totals.c.credit_amount), 0).label("today_credit"),
+        )
+        .select_from(Bill)
+        .outerjoin(credit_totals, credit_totals.c.bill_id == Bill.id)
+        .where(*today_filters)
+    )
+
+    today_summary = today_result.one()
+
+    count_result = await db.execute(
+        select(func.count(Bill.id)).where(*filters)
+    )
+
+    total_bills = count_result.scalar_one()
+
+    history_result = await db.execute(
+        select(
+            Bill,
+            Customer.name.label("customer_name"),
+            Customer.phone.label("customer_phone"),
+            func.coalesce(payment_totals.c.paid_amount, 0).label("paid_amount"),
+            func.coalesce(credit_totals.c.credit_amount, 0).label("credit_amount"),
+        )
+        .select_from(Bill)
+        .outerjoin(Customer, Customer.id == Bill.customer_id)
+        .outerjoin(payment_totals, payment_totals.c.bill_id == Bill.id)
+        .outerjoin(credit_totals, credit_totals.c.bill_id == Bill.id)
+        .where(*filters)
+        .order_by(Bill.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+
+    rows = history_result.all()
+    bills = []
+
+    for row in rows:
+        bill = row[0]
+        paid_amount = money(row.paid_amount or 0)
+        credit_amount = money(row.credit_amount or 0)
+
+        items_result = await db.execute(
+            select(BillItem).where(
+                BillItem.bill_id == bill.id,
+                BillItem.product_id.in_(vegetable_product_ids),
+            ).order_by(BillItem.created_at.asc())
+        )
+
+        items = items_result.scalars().all()
+
+        if credit_amount > ZERO:
+            payment_status = (
+                "CREDIT" if paid_amount <= ZERO else "PARTIAL"
+            )
+        else:
+            payment_status = (
+                "PAID"
+                if paid_amount >= money(bill.total_amount)
+                else "UNPAID"
+            )
+
+        bills.append({
+            "bill_id": str(bill.id),
+            "bill_number": bill.bill_number,
+            "created_at": (
+                bill.created_at.isoformat()
+                if bill.created_at else None
+            ),
+            "status": bill.status,
+            "customer": (
+                {
+                    "name": row.customer_name,
+                    "phone": row.customer_phone,
+                }
+                if row.customer_name else None
+            ),
+            "subtotal": str(money(bill.subtotal)),
+            "discount_amount": str(money(bill.discount_amount)),
+            "tax_amount": str(money(bill.tax_amount)),
+            "total_amount": str(money(bill.total_amount)),
+            "paid_amount": str(paid_amount),
+            "credit_amount": str(credit_amount),
+            "payment_status": payment_status,
+            "items": [
+                {
+                    "product_id": (
+                        str(item.product_id)
+                        if item.product_id else None
+                    ),
+                    "name": item.item_name,
+                    "weight_kg": str(item.quantity),
+                    "price_per_kg": str(item.unit_price),
+                    "offer_price_per_kg": (
+                        str(item.offer_price)
+                        if item.offer_price is not None else None
+                    ),
+                    "discount_amount": str(item.discount_amount),
+                    "tax_rate": str(item.tax_rate),
+                    "tax_amount": str(item.tax_amount),
+                    "line_total": str(item.line_total),
+                }
+                for item in items
+            ],
+        })
+
+    return {
+        "type": "success",
+        "data": {
+            "summary": {
+                "bill_count": int(summary.bill_count or 0),
+                "total_sales": str(money(summary.total_sales or 0)),
+                "total_paid": str(money(summary.total_paid or 0)),
+                "total_credit": str(money(summary.total_credit or 0)),
+                "today_sales": str(money(today_summary.today_sales or 0)),
+                "today_credit": str(money(today_summary.today_credit or 0)),
+                "currency": "INR",
+            },
+            "filters": {
+                "start_date": (
+                    start_date.isoformat() if start_date else None
+                ),
+                "end_date": (
+                    end_date.isoformat() if end_date else None
+                ),
+            },
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_bills": int(total_bills or 0),
+                "total_pages": (
+                    (int(total_bills) + page_size - 1) // page_size
+                ),
+                "returned": len(bills),
+            },
+            "bills": bills,
+        },
+    }
+
+
+# ---------------------------------------------------------
+# GET VEGETABLE BY UUID
+# Keep this dynamic route after static routes.
 # ---------------------------------------------------------
 
 @router.get(
